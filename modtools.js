@@ -13126,6 +13126,9 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
   function isLeadMod(){ return !!getSetting('isLeadMod', false); }
   // v5.2.0 fun fix: one-time nudge when the user tries a cloud feature without a token.
   let _tokenNudgeShown = false;
+  // v8.2.1: consecutive-401 counter so the onboarding modal only re-triggers
+  // after 3 sequential 401s (not on every transient auth hiccup).
+  let _consecutive401 = 0;
   // v7.2: legacy direct-fetch workerCall. Attaches 'X-Mod-Token' and
   // 'X-Lead-Token' headers from in-page settings -- used ONLY when the
   // platformHardening flag is OFF. Flag-on path routes through the
@@ -13137,6 +13140,20 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
         _tokenNudgeShown = true;
         try { snack('Team mod token not set \u2014 open the popup to configure', 'warn'); } catch(e){}
       }
+      // v8.2.1: storage-authoritative gate. Do one async read before showing
+      // the modal; if storage has the token, hydrate cache and return a fake
+      // 'try again' signal instead of bothering the user.
+      try {
+        if (chrome?.storage?.local) {
+          const rr = await chrome.storage.local.get(K_SETTINGS);
+          const st = rr && rr[K_SETTINGS];
+          if (st && st.workerModToken){
+            _secretsCache['workerModToken'] = st.workerModToken;
+            if (st.leadModToken) _secretsCache['leadModToken'] = st.leadModToken;
+            return { ok:false, error:'token was cached-stale; retry', retryable:true };
+          }
+        }
+      } catch(e){}
       try { showTokenOnboardingModal('missing'); } catch(e){}
       return { ok:false, error:'no mod token configured' };
     }
@@ -13168,10 +13185,25 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
       });
       const text = await r.text();
       let data = null; try { data = JSON.parse(text); } catch(e){}
-      // If the worker rejects our token (401), surface the onboarding modal
-      // so the mod can paste a fresh one without digging through settings.
+      // v8.2.1: debounced rejection modal. A single 401 no longer triggers
+      // the modal -- we only show it after >=3 consecutive 401s AND confirm
+      // storage ACTUALLY has no valid-looking token. Eliminates the "modal
+      // pops up on every rare 401 spike" rage pattern.
       if (r.status === 401){
-        try { showTokenOnboardingModal('rejected'); } catch(e){}
+        _consecutive401 = (_consecutive401 || 0) + 1;
+        if (_consecutive401 >= 3) {
+          try {
+            if (chrome?.storage?.local) {
+              const rr = await chrome.storage.local.get(K_SETTINGS);
+              const st = rr && rr[K_SETTINGS];
+              if (!st || !st.workerModToken) {
+                try { showTokenOnboardingModal('rejected'); } catch(e){}
+              }
+            }
+          } catch(e){}
+        }
+      } else if (r.status >= 200 && r.status < 400) {
+        _consecutive401 = 0;
       }
       return { ok: r.ok, status: r.status, data, text };
     } catch(e) {
@@ -13353,8 +13385,22 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     } catch(e){}
     // Surface onboarding modal when the worker rejects the token via the
     // relay path too -- keeps parity with __legacyWorkerCall's 401 branch.
+    // v8.2.1: same debounce + storage-check as the legacy path.
     if (r && r.status === 401){
-      try { showTokenOnboardingModal('rejected'); } catch(e){}
+      _consecutive401 = (_consecutive401 || 0) + 1;
+      if (_consecutive401 >= 3) {
+        try {
+          if (chrome?.storage?.local) {
+            const rr = await chrome.storage.local.get(K_SETTINGS);
+            const st = rr && rr[K_SETTINGS];
+            if (!st || !st.workerModToken) {
+              try { showTokenOnboardingModal('rejected'); } catch(e){}
+            }
+          }
+        } catch(e){}
+      }
+    } else if (r && r.status >= 200 && r.status < 400) {
+      _consecutive401 = 0;
     }
     return r;
   }
@@ -14500,8 +14546,28 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     // Onboarding: if this browser is a mod but has never been issued a token,
     // prompt them to paste one. Lead mints the token via provision-mod-token.ps1
     // and DMs it to the mod; the mod pastes into this modal on first boot.
+    // v8.2.1: STORAGE-AUTHORITATIVE gate. Cache-only check (getModToken) was
+    // re-showing the modal to users who already had a token persisted because
+    // _secretsCache rehydration could race with init. Now we do one async
+    // read of chrome.storage.local RIGHT BEFORE the modal renders, and if
+    // storage has ANY workerModToken we hydrate the cache and skip the modal
+    // entirely. The modal is FORBIDDEN from firing when storage has a token.
     if (isMod && !getModToken()){
-      setTimeout(() => { try { showTokenOnboardingModal('missing'); } catch(e){} }, 1500);
+      setTimeout(async () => {
+        try {
+          if (chrome?.storage?.local) {
+            const r = await chrome.storage.local.get(K_SETTINGS);
+            const stored = r && r[K_SETTINGS];
+            if (stored && typeof stored === 'object' && stored.workerModToken){
+              _secretsCache['workerModToken'] = stored.workerModToken;
+              if (stored.leadModToken) _secretsCache['leadModToken'] = stored.leadModToken;
+              console.log('[modtools] v8.2.1 modal-suppress: token found in storage, cache rehydrated');
+              return;
+            }
+          }
+        } catch(e){ console.warn('[modtools] storage check failed before modal:', e); }
+        try { showTokenOnboardingModal('missing'); } catch(e){}
+      }, 1500);
     }
 
     // v5.1.10: Presence HUD (lead-mod only)
