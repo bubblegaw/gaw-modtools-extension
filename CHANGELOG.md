@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file.
 
 ## [8.2.7] - 2026-04-24
 
+Based on: `8.2.6`
+
 ### Fixed
 - Persisted mod-token state reliably across refresh/restart by syncing token writes between popup secure-save flow, background vault, and durable `chrome.storage.local`.
 - Prevented partial token updates from clobbering existing secrets (lead-token writes no longer clear team-token state).
@@ -15,4 +17,3 @@ All notable changes to this project are documented in this file.
 ### Security / Reliability
 - Background vault now falls back to durable local settings when session storage is empty after worker restart.
 - Token relay update semantics now support field-preserving partial updates.
-
