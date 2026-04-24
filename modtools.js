@@ -13203,6 +13203,9 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
       // the modal -- we only show it after >=3 consecutive 401s AND confirm
       // storage ACTUALLY has no valid-looking token. Eliminates the "modal
       // pops up on every rare 401 spike" rage pattern.
+      // v8.2.3: ALSO respect tokenOnboardedOnce -- if the user has ever
+      // successfully onboarded, 401s never re-open the modal; they surface
+      // as normal HTTP errors in the caller's UI instead.
       if (r.status === 401){
         _consecutive401 = (_consecutive401 || 0) + 1;
         if (_consecutive401 >= 3) {
@@ -13210,7 +13213,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
             if (chrome?.storage?.local) {
               const rr = await chrome.storage.local.get(K_SETTINGS);
               const st = rr && rr[K_SETTINGS];
-              if (!st || !st.workerModToken) {
+              if (!st || (!st.workerModToken && !st.tokenOnboardedOnce)) {
                 try { showTokenOnboardingModal('rejected'); } catch(e){}
               }
             }
@@ -13319,16 +13322,27 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
           // then also update the in-memory cache + settings object. If either
           // step fails silently, the other still persists the token. The modal
           // will not re-appear on reload because the direct write is awaited.
+          // v8.2.3: ALSO set a PERSISTENT `tokenOnboardedOnce` flag. Once
+          // true, the init-time modal gate NEVER fires again on this install.
+          // This is the last line of defense against the "modal keeps asking
+          // forever" class of bugs. Only cleared by explicit full reinstall.
           try {
             if (chrome?.storage?.local){
               const cur = await chrome.storage.local.get(K_SETTINGS);
-              const merged = { ...(cur[K_SETTINGS] || {}), workerModToken: pasted };
+              const merged = {
+                ...(cur[K_SETTINGS] || {}),
+                workerModToken: pasted,
+                tokenOnboardedOnce: true,
+                tokenOnboardedAt: Date.now(),
+                tokenOnboardedAs: data.username
+              };
               await chrome.storage.local.set({ [K_SETTINGS]: merged });
             }
           } catch(e){ console.error('[modtools] modal-save direct write failed', e); }
           // Belt-and-suspenders: also update the cache + legacy setSetting path.
           try { _secretsCache['workerModToken'] = pasted; } catch(e){}
           try { await setSetting('workerModToken', pasted); } catch(e){}
+          try { await setSetting('tokenOnboardedOnce', true); } catch(e){}
           close();
           try { snack(`Welcome, ${data.username}`, 'success'); } catch(e){}
           // Re-run init so token-gated features (presence, crawler, titles) wire up.
@@ -13400,6 +13414,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     // Surface onboarding modal when the worker rejects the token via the
     // relay path too -- keeps parity with __legacyWorkerCall's 401 branch.
     // v8.2.1: same debounce + storage-check as the legacy path.
+    // v8.2.3: also respects tokenOnboardedOnce persistent flag.
     if (r && r.status === 401){
       _consecutive401 = (_consecutive401 || 0) + 1;
       if (_consecutive401 >= 3) {
@@ -13407,7 +13422,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
           if (chrome?.storage?.local) {
             const rr = await chrome.storage.local.get(K_SETTINGS);
             const st = rr && rr[K_SETTINGS];
-            if (!st || !st.workerModToken) {
+            if (!st || (!st.workerModToken && !st.tokenOnboardedOnce)) {
               try { showTokenOnboardingModal('rejected'); } catch(e){}
             }
           }
@@ -14560,23 +14575,33 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     // Onboarding: if this browser is a mod but has never been issued a token,
     // prompt them to paste one. Lead mints the token via provision-mod-token.ps1
     // and DMs it to the mod; the mod pastes into this modal on first boot.
-    // v8.2.1: STORAGE-AUTHORITATIVE gate. Cache-only check (getModToken) was
-    // re-showing the modal to users who already had a token persisted because
-    // _secretsCache rehydration could race with init. Now we do one async
-    // read of chrome.storage.local RIGHT BEFORE the modal renders, and if
-    // storage has ANY workerModToken we hydrate the cache and skip the modal
-    // entirely. The modal is FORBIDDEN from firing when storage has a token.
+    // v8.2.1: storage-authoritative gate (hydrate cache if storage has token).
+    // v8.2.3: ALSO honor `tokenOnboardedOnce` persistent flag. Once a mod
+    // has EVER successfully authenticated via the modal (flag flipped true
+    // on whoami 200), the init-time modal is permanently suppressed. Real
+    // token problems surface as errors in action attempts; the onboarding
+    // modal itself is a FIRST-BOOT-ONLY surface.
     if (isMod && !getModToken()){
       setTimeout(async () => {
         try {
           if (chrome?.storage?.local) {
             const r = await chrome.storage.local.get(K_SETTINGS);
             const stored = r && r[K_SETTINGS];
-            if (stored && typeof stored === 'object' && stored.workerModToken){
-              _secretsCache['workerModToken'] = stored.workerModToken;
-              if (stored.leadModToken) _secretsCache['leadModToken'] = stored.leadModToken;
-              console.log('[modtools] v8.2.1 modal-suppress: token found in storage, cache rehydrated');
-              return;
+            if (stored && typeof stored === 'object'){
+              // Path 1: storage has a token -- hydrate cache, skip modal.
+              if (stored.workerModToken){
+                _secretsCache['workerModToken'] = stored.workerModToken;
+                if (stored.leadModToken) _secretsCache['leadModToken'] = stored.leadModToken;
+                console.log('[modtools] v8.2.3 modal-suppress: token found in storage');
+                return;
+              }
+              // Path 2: token is missing but user has onboarded at least
+              // once before -- assume transient, suppress modal. User can
+              // manually re-onboard via the popup if they really need to.
+              if (stored.tokenOnboardedOnce){
+                console.warn('[modtools] v8.2.3 modal-suppress: token missing but tokenOnboardedOnce=true; suppressing modal (use popup to re-enter if needed)');
+                return;
+              }
             }
           }
         } catch(e){ console.warn('[modtools] storage check failed before modal:', e); }
