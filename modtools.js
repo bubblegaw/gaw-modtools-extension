@@ -1204,10 +1204,31 @@
   const _secretsCache = {};
   async function preloadSecrets(){
     try {
-      if (!chrome?.storage?.local) return;
-      const { [K_SETTINGS]: stored } = await chrome.storage.local.get(K_SETTINGS);
-      if (stored && typeof stored === 'object'){
-        for (const k of SECRET_SETTING_KEYS){
+      let stored = null;
+      if (chrome?.storage?.local) {
+        const localOut = await chrome.storage.local.get(K_SETTINGS);
+        stored = localOut && localOut[K_SETTINGS];
+      }
+
+      // Recovery path: older hardening builds could stash tokens only in
+      // chrome.storage.session. If local settings lost those keys, hydrate
+      // from session and immediately re-persist to local so refresh/restart
+      // no longer re-prompts for token.
+      if ((!stored || !stored.workerModToken) && chrome?.storage?.session) {
+        try {
+          const sessionOut = await chrome.storage.session.get(K_SETTINGS);
+          const sessionStored = sessionOut && sessionOut[K_SETTINGS];
+          if (sessionStored && typeof sessionStored === 'object' && sessionStored.workerModToken) {
+            stored = { ...(stored || {}), ...sessionStored };
+            if (chrome?.storage?.local) {
+              await chrome.storage.local.set({ [K_SETTINGS]: stored });
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (stored && typeof stored === 'object') {
+        for (const k of SECRET_SETTING_KEYS) {
           if (k in stored) _secretsCache[k] = stored[k];
         }
       }
