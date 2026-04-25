@@ -309,19 +309,35 @@ function __isTokenShape(t) {
 // popup; the background service worker owns the session-area persistence.
 async function saveTokensSecurely(tokens) {
   const t = tokens || {};
-  if (t.workerModToken && !__isTokenShape(t.workerModToken)) {
+  const hasWorker = Object.prototype.hasOwnProperty.call(t, 'workerModToken');
+  const hasLead = Object.prototype.hasOwnProperty.call(t, 'leadModToken');
+  if (hasWorker && t.workerModToken && !__isTokenShape(t.workerModToken)) {
     return { ok: false, error: 'malformed team token' };
   }
-  if (t.leadModToken && !__isTokenShape(t.leadModToken)) {
+  if (hasLead && t.leadModToken && !__isTokenShape(t.leadModToken)) {
     return { ok: false, error: 'malformed lead token' };
   }
   try {
-    const r = await chrome.runtime.sendMessage({
-      type: 'setTokens',
-      workerModToken: t.workerModToken || '',
-      leadModToken: t.leadModToken || ''
-    });
-    return r || { ok: false, error: 'no response from background' };
+    const msg = { type: 'setTokens' };
+    if (hasWorker) msg.workerModToken = t.workerModToken || '';
+    if (hasLead) msg.leadModToken = t.leadModToken || '';
+    const r = await chrome.runtime.sendMessage(msg);
+    if (!r || !r.ok) return r || { ok: false, error: 'no response from background' };
+
+    // Keep durable local copy in sync so content-script boot paths that still
+    // read chrome.storage.local can hydrate immediately after refresh/restart.
+    try {
+      const current = await chrome.storage.local.get('gam_settings');
+      const s = { ...(current.gam_settings || {}) };
+      if (hasWorker) s.workerModToken = t.workerModToken || '';
+      if (hasLead) {
+        s.leadModToken = t.leadModToken || '';
+        s.isLeadMod = !!(t.leadModToken || '');
+      }
+      await chrome.storage.local.set({ gam_settings: s });
+    } catch (e) {}
+
+    return r;
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
   }
@@ -491,10 +507,7 @@ async function saveLead() {
   if (await __hardeningOnPopup()) {
     // Empty -> clear (set both to '' via relay? no -- preserve team side).
     if (!token) {
-      const r = await saveTokensSecurely({ workerModToken: '', leadModToken: '' });
-      // This intentionally clears BOTH under flag-on because the vault is
-      // all-or-nothing. For partial clear a dedicated handler would be
-      // needed -- out of scope for session 1.
+      const r = await saveTokensSecurely({ leadModToken: '' });
       if (r && r.ok) {
         statusEl.textContent = 'cleared';
         try { $('leadInput').value = ''; } catch (e) {}
@@ -509,40 +522,14 @@ async function saveLead() {
       statusEl.textContent = 'malformed lead token';
       return;
     }
-    // Need to preserve team token. The relay's setTokens replaces BOTH, so
-    // grab the team token once from the user (caveat: flag-on popup has no
-    // prefill). For v7.2 session-1 scope we require team token already set
-    // in vault; we don't refetch it (no back-channel exposed). Instead the
-    // background only updates lead when team is already present. This is a
-    // deliberate limitation that Session 2's proper implementation will
-    // replace with a setTokens handler that accepts partial updates.
-    // Interim shim: send leadModToken only; background vault overwrites
-    // only the fields present.
-    try {
-      const r = await chrome.runtime.sendMessage({
-        type: 'setTokens',
-        // Intentionally OMIT workerModToken -- background handler reads
-        // msg.workerModToken (empty string default), so an omitted field
-        // would blank the team token. To avoid that, we resend the current
-        // status-indicated team state: we can't read the actual secret
-        // back, so we fall through to an error state requiring the team
-        // token be re-entered first.
-        workerModToken: '',
-        leadModToken: token
-      });
-      // If the background blanked the team token we surface a warning so
-      // the user re-saves it; this is the intentional v7.2 limitation.
-      if (r && r.ok) {
-        statusEl.className = 'pop-token-status ok';
-        statusEl.textContent = '\u2713 stored \u2014 re-save team token if needed';
-        try { $('leadInput').value = ''; } catch (e) {}
-      } else {
-        statusEl.className = 'pop-token-status err';
-        statusEl.textContent = 'save failed';
-      }
-    } catch (e) {
+    const r = await saveTokensSecurely({ leadModToken: token });
+    if (r && r.ok) {
+      statusEl.className = 'pop-token-status ok';
+      statusEl.textContent = '\u2713 stored';
+      try { $('leadInput').value = ''; } catch (e) {}
+    } else {
       statusEl.className = 'pop-token-status err';
-      statusEl.textContent = 'save failed: ' + (e && e.message || e);
+      statusEl.textContent = 'save failed: ' + (r && r.error || 'unknown');
     }
     return;
   }

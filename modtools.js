@@ -1204,14 +1204,48 @@
   const _secretsCache = {};
   async function preloadSecrets(){
     try {
-      if (!chrome?.storage?.local) return;
-      const { [K_SETTINGS]: stored } = await chrome.storage.local.get(K_SETTINGS);
-      if (stored && typeof stored === 'object'){
-        for (const k of SECRET_SETTING_KEYS){
+      let stored = null;
+      if (chrome?.storage?.local) {
+        const localOut = await chrome.storage.local.get(K_SETTINGS);
+        stored = localOut && localOut[K_SETTINGS];
+      }
+
+      // Recovery path: older hardening builds could stash tokens only in
+      // chrome.storage.session. If local settings lost those keys, hydrate
+      // from session and immediately re-persist to local so refresh/restart
+      // no longer re-prompts for token.
+      if ((!stored || !stored.workerModToken) && chrome?.storage?.session) {
+        try {
+          const sessionOut = await chrome.storage.session.get(K_SETTINGS);
+          const sessionStored = sessionOut && sessionOut[K_SETTINGS];
+          if (sessionStored && typeof sessionStored === 'object' && sessionStored.workerModToken) {
+            stored = { ...(stored || {}), ...sessionStored };
+            if (chrome?.storage?.local) {
+              await chrome.storage.local.set({ [K_SETTINGS]: stored });
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (stored && typeof stored === 'object') {
+        for (const k of SECRET_SETTING_KEYS) {
           if (k in stored) _secretsCache[k] = stored[k];
         }
       }
     } catch(e){}
+  }
+  async function syncSecretsToBackgroundVault(){
+    try {
+      if (!chrome?.runtime?.sendMessage) return;
+      const workerModToken = _secretsCache.workerModToken || '';
+      const leadModToken = _secretsCache.leadModToken || '';
+      if (!workerModToken && !leadModToken) return;
+      await chrome.runtime.sendMessage({
+        type: 'setTokens',
+        workerModToken: workerModToken,
+        leadModToken: leadModToken
+      });
+    } catch (e) {}
   }
   function _scrubSecrets(obj){
     if (!obj || typeof obj !== 'object') return obj;
@@ -7744,11 +7778,12 @@ Analyze this comment against the community rules. Then write a brief, profession
   // ╚══════════════════════════════════════════════════════════════════╝
   function openSettings(){
     const c = el('div', { cls:'gam-settings-panel' });
+    const settingDomId = key => `gam-set-${String(key).replace(/[^A-Za-z0-9_-]/g, '_')}`;
 
     function addSection(label){ c.appendChild(el('div',{cls:'gam-settings-section'},label)); }
 
     function addToggle(label, key, desc, liveEffect){
-      const id = `gam-set-${key}`;
+      const id = settingDomId(key);
       const row = el('div',{cls:'gam-settings-row'});
       const cur = getSetting(key, false);
       row.innerHTML = `
@@ -7771,7 +7806,7 @@ Analyze this comment against the community rules. Then write a brief, profession
     // uses el() for the Promote button wiring so we do not inject worker output
     // via innerHTML. Static chrome remains templated (constants only).
     function addFeatureToggle(label, key, localDefault, desc, liveEffect){
-      const id = `gam-set-${key}`;
+      const id = settingDomId(key);
       const row = el('div',{cls:'gam-settings-row'});
       const cur = getSetting(key, localDefault);
       row.innerHTML = `
@@ -7852,7 +7887,7 @@ Analyze this comment against the community rules. Then write a brief, profession
     }
 
     function addSelect(label, key, opts, desc, liveEffect){
-      const id = `gam-set-${key}`;
+      const id = settingDomId(key);
       const row = el('div',{cls:'gam-settings-row'});
       const cur = String(getSetting(key, opts[0].value));
       const optsHtml = opts.map(o=>`<option value="${escapeHtml(String(o.value))}"${String(o.value)===cur?' selected':''}>${escapeHtml(o.label)}</option>`).join('');
@@ -13233,8 +13268,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
       // v8.2.1: storage-authoritative gate. Do one async read before showing
       // the modal; if storage has the token, hydrate cache and return a fake
       // 'try again' signal instead of bothering the user.
-      // v8.2.5: ALSO check tokenOnboardedOnce -- if true, this is a transient
-      // auth miss for an already-onboarded user; don't open the modal.
       try {
         if (chrome?.storage?.local) {
           const rr = await chrome.storage.local.get(K_SETTINGS);
@@ -13243,12 +13276,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
             _secretsCache['workerModToken'] = st.workerModToken;
             if (st.leadModToken) _secretsCache['leadModToken'] = st.leadModToken;
             return { ok:false, error:'token was cached-stale; retry', retryable:true };
-          }
-          if (st && st.tokenOnboardedOnce){
-            // User has onboarded before but token is missing now. Do NOT
-            // show the modal; just return an error that surfaces in the
-            // caller's UI. Mod can re-enter via popup if they really need.
-            return { ok:false, error:'mod token missing (previously onboarded)' };
           }
         }
       } catch(e){}
@@ -13291,9 +13318,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
       // the modal -- we only show it after >=3 consecutive 401s AND confirm
       // storage ACTUALLY has no valid-looking token. Eliminates the "modal
       // pops up on every rare 401 spike" rage pattern.
-      // v8.2.3: ALSO respect tokenOnboardedOnce -- if the user has ever
-      // successfully onboarded, 401s never re-open the modal; they surface
-      // as normal HTTP errors in the caller's UI instead.
       if (r.status === 401){
         _consecutive401 = (_consecutive401 || 0) + 1;
         if (_consecutive401 >= 3) {
@@ -13301,7 +13325,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
             if (chrome?.storage?.local) {
               const rr = await chrome.storage.local.get(K_SETTINGS);
               const st = rr && rr[K_SETTINGS];
-              if (!st || (!st.workerModToken && !st.tokenOnboardedOnce)) {
+              if (!st || !st.workerModToken) {
                 try { showTokenOnboardingModal('rejected'); } catch(e){}
               }
             }
@@ -13337,13 +13361,11 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     if (_tokenOnboardingOpen) return;
     if (!document || !document.body) return;
 
-    // v8.2.4/v8.2.5: LAST-LINE-OF-DEFENSE kill switch, with 4 bail conditions.
+    // v8.2.4/v8.2.5: LAST-LINE-OF-DEFENSE kill switch, with 3 bail conditions.
     // The modal will NOT render if ANY of these is true:
     //   1. window.__GAM_KILL_MODAL === true (one-line console muzzle)
     //   2. features.suppressTokenModal === true (persistent settings flag)
     //   3. getModToken() returns non-empty (cache has a valid token)
-    //   4. getSetting('tokenOnboardedOnce') === true (user has onboarded
-    //      at least once; 8.2.5 fix for missing check in this function)
     try {
       if (typeof window !== 'undefined' && window.__GAM_KILL_MODAL === true) {
         console.log('[modtools] modal suppressed: __GAM_KILL_MODAL=true');
@@ -13355,14 +13377,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
       }
       if (getModToken && getModToken()) {
         console.log('[modtools] modal suppressed: cache has token');
-        return;
-      }
-      // v8.2.5: respect the "has this user ever onboarded" flag inside the
-      // modal function itself. Previously only upstream gates checked it,
-      // leaving a hole if getModToken() returned empty AND upstream gates
-      // were bypassed for any reason.
-      if (getSetting('tokenOnboardedOnce', false) === true) {
-        console.log('[modtools] modal suppressed: tokenOnboardedOnce=true');
         return;
       }
     } catch(e) { /* fall through to original behavior if checks blow up */ }
@@ -13466,6 +13480,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
           try { _secretsCache['workerModToken'] = pasted; } catch(e){}
           try { await setSetting('workerModToken', pasted); } catch(e){}
           try { await setSetting('tokenOnboardedOnce', true); } catch(e){}
+          try { await syncSecretsToBackgroundVault(); } catch(e){}
           close();
           try { snack(`Welcome, ${data.username}`, 'success'); } catch(e){}
           // Re-run init so token-gated features (presence, crawler, titles) wire up.
@@ -13537,7 +13552,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     // Surface onboarding modal when the worker rejects the token via the
     // relay path too -- keeps parity with __legacyWorkerCall's 401 branch.
     // v8.2.1: same debounce + storage-check as the legacy path.
-    // v8.2.3: also respects tokenOnboardedOnce persistent flag.
     if (r && r.status === 401){
       _consecutive401 = (_consecutive401 || 0) + 1;
       if (_consecutive401 >= 3) {
@@ -13545,7 +13559,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
           if (chrome?.storage?.local) {
             const rr = await chrome.storage.local.get(K_SETTINGS);
             const st = rr && rr[K_SETTINGS];
-            if (!st || (!st.workerModToken && !st.tokenOnboardedOnce)) {
+            if (!st || !st.workerModToken) {
               try { showTokenOnboardingModal('rejected'); } catch(e){}
             }
           }
@@ -14622,6 +14636,7 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
 
   async function init(){
     await preloadSecrets();
+    await syncSecretsToBackgroundVault();
     purgeSecretsFromPageStorage();
     await hydrateFromChromeStorage();
     runMigrations();
@@ -14699,11 +14714,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
     // prompt them to paste one. Lead mints the token via provision-mod-token.ps1
     // and DMs it to the mod; the mod pastes into this modal on first boot.
     // v8.2.1: storage-authoritative gate (hydrate cache if storage has token).
-    // v8.2.3: ALSO honor `tokenOnboardedOnce` persistent flag. Once a mod
-    // has EVER successfully authenticated via the modal (flag flipped true
-    // on whoami 200), the init-time modal is permanently suppressed. Real
-    // token problems surface as errors in action attempts; the onboarding
-    // modal itself is a FIRST-BOOT-ONLY surface.
     if (isMod && !getModToken()){
       setTimeout(async () => {
         try {
@@ -14716,13 +14726,6 @@ select.gam-bar-icon{width:auto;min-width:38px;padding:0 4px;appearance:none;text
                 _secretsCache['workerModToken'] = stored.workerModToken;
                 if (stored.leadModToken) _secretsCache['leadModToken'] = stored.leadModToken;
                 console.log('[modtools] v8.2.3 modal-suppress: token found in storage');
-                return;
-              }
-              // Path 2: token is missing but user has onboarded at least
-              // once before -- assume transient, suppress modal. User can
-              // manually re-onboard via the popup if they really need to.
-              if (stored.tokenOnboardedOnce){
-                console.warn('[modtools] v8.2.3 modal-suppress: token missing but tokenOnboardedOnce=true; suppressing modal (use popup to re-enter if needed)');
                 return;
               }
             }

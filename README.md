@@ -4,7 +4,7 @@ Professional moderator toolkit for [greatawakening.win](https://www.greatawakeni
 
 Chrome extension + Cloudflare Worker backend providing a unified Mod Console, shared team flags, audit log, Death Row queue, AI-assisted ban drafting, Shadow Queue triage, Park button for senior handoff, Discord bridge with Grok + Claude, and per-mod authentication with cross-mod sync.
 
-**Current version:** 8.1.5
+**Current version:** 8.2.7
 
 ---
 

@@ -55,9 +55,23 @@ async function __ensureSessionAccess(){
 
 async function loadSecrets() {
   try {
-    if (!chrome.storage || !chrome.storage.session) return;
-    const out = await chrome.storage.session.get('gam_settings');
-    const s = (out && out.gam_settings) || {};
+    let s = {};
+    if (chrome.storage && chrome.storage.session) {
+      const out = await chrome.storage.session.get('gam_settings');
+      s = (out && out.gam_settings) || {};
+    }
+    // Fallback to durable local settings if session storage is empty (e.g.
+    // service-worker restart or browser restart before popup re-sync).
+    if ((!s.workerModToken && !s.leadModToken) && chrome.storage && chrome.storage.local) {
+      try {
+        const localOut = await chrome.storage.local.get('gam_settings');
+        const ls = (localOut && localOut.gam_settings) || {};
+        s = {
+          workerModToken: ls.workerModToken || '',
+          leadModToken: ls.leadModToken || ''
+        };
+      } catch (e) {}
+    }
     secretCache = {
       workerModToken: s.workerModToken || '',
       leadModToken: s.leadModToken || ''
@@ -147,9 +161,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // --- v7.2 Platform Hardening BEGIN ---
   if (msg && msg.type === 'setTokens') {
+    const hasWorker = Object.prototype.hasOwnProperty.call(msg, 'workerModToken');
+    const hasLead = Object.prototype.hasOwnProperty.call(msg, 'leadModToken');
     secretCache = {
-      workerModToken: (typeof msg.workerModToken === 'string') ? msg.workerModToken : '',
-      leadModToken: (typeof msg.leadModToken === 'string') ? msg.leadModToken : ''
+      workerModToken: hasWorker
+        ? ((typeof msg.workerModToken === 'string') ? msg.workerModToken : '')
+        : (secretCache.workerModToken || ''),
+      leadModToken: hasLead
+        ? ((typeof msg.leadModToken === 'string') ? msg.leadModToken : '')
+        : (secretCache.leadModToken || '')
     };
     (async () => {
       try {
