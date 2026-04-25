@@ -45,7 +45,7 @@ const REPO_BRANCH = 'main';
 const BUG_REPO_NAME = 'gaw-mod-shared-flags';  // reuse same repo for issues
 
 // Keep in sync with gaw-mod-shared-flags/version.json on every worker deploy.
-const WORKER_VERSION = '6.1.2';
+const WORKER_VERSION = '8.3.0';
 
 const BUDGET_XAI_CALLS_PER_DAY = 200;
 const WRITE_RATE_PER_MINUTE = 30;
@@ -54,6 +54,43 @@ const INVITE_TTL_SEC = 24 * 60 * 60;
 
 const writeBuckets = new Map();
 const xaiDailyCounter = { day: '', count: 0 };
+
+// ---- v8.3.0 hardening constants ----
+// Per-mod AI minute cap is KV-backed (per-isolate Maps don't enforce at edge
+// scale) — bucket key is `ai_minute_<discord_id|hash(mod_token)>_<minute_bucket>`,
+// TTL 120s so the bucket auto-evicts.
+const AI_PER_MOD_PER_MINUTE = 20;
+
+// Circuit breaker: per-provider failure counter in KV. Open after 5 failures
+// in a 60s window; half-open after 30s; full reset on a single success.
+const CB_FAIL_THRESHOLD = 5;
+const CB_FAIL_WINDOW_SEC = 60;
+const CB_OPEN_DURATION_SEC = 30;
+
+// Discord webhook retry: defaults; per-row override possible (max_attempts col).
+const DISCORD_RETRY_MAX_ATTEMPTS = 6;
+const DISCORD_RETRY_PER_TICK = 25;             // bound work per cron tick
+const DISCORD_RETRY_BACKOFF_BASE_MS = 30_000;  // 30s, doubled per attempt
+
+// Body-size cap on multi-write endpoints (bytes). 256 KB is generous for
+// audit/profile/parked/message payloads but cheaply defends against
+// accidental megabyte uploads via crafted clients.
+const MAX_JSON_BYTES = 256 * 1024;
+
+// CORS lockdown: high-sensitivity endpoints accept these origins only.
+// Other endpoints retain wildcard '*' for backward-compat with the extension.
+const CORS_STRICT_ORIGINS = new Set([
+  'https://greatawakening.win',
+  'https://www.greatawakening.win'
+]);
+
+// CORS lockdown applies to these path PREFIXES + exact matches.
+const CORS_STRICT_PATH_PREFIXES = ['/admin/'];
+const CORS_STRICT_PATH_EXACT = new Set([
+  '/bot/register-commands',
+  '/bot/mods/add',
+  '/bot/mods/remove'
+]);
 
 // ---- helpers ----
 
@@ -67,6 +104,338 @@ function jsonResponse(body, status = 200) {
       'access-control-allow-methods': 'GET,POST,OPTIONS'
     }
   });
+}
+
+// ---- v8.3.0 helpers (hardening drop) ----
+
+// safeJson: parses request JSON with a hard byte cap so a crafted client
+// can't OOM the worker on multi-write endpoints. Returns either the parsed
+// body or a Response (caller short-circuits with `if (parsed instanceof
+// Response) return parsed;`).
+async function safeJson(request, maxBytes = MAX_JSON_BYTES) {
+  const cl = parseInt(request.headers.get('content-length') || '0', 10);
+  if (cl && cl > maxBytes) {
+    return jsonResponse({ error: 'payload too large', max_bytes: maxBytes }, 413);
+  }
+  // content-length is advisory (chunked encoding may omit it). Read with a
+  // streaming guard.
+  const reader = request.body && request.body.getReader && request.body.getReader();
+  if (!reader) {
+    // Fallback: trust the platform if we can't stream (shouldn't happen on CF).
+    try { return await request.json(); }
+    catch (e) { return jsonResponse({ error: 'invalid json' }, 400); }
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    // Bounded read: the moment we cross maxBytes we stop and 413.
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { reader.cancel(); } catch {}
+        return jsonResponse({ error: 'payload too large', max_bytes: maxBytes }, 413);
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    return jsonResponse({ error: 'read error: ' + String(e).slice(0, 200) }, 400);
+  }
+  // Reassemble + parse.
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength; }
+  let text;
+  try { text = new TextDecoder().decode(buf); }
+  catch (e) { return jsonResponse({ error: 'utf8 decode failed' }, 400); }
+  try { return JSON.parse(text); }
+  catch (e) { return jsonResponse({ error: 'invalid json' }, 400); }
+}
+
+// aiCallerKey: stable per-mod identifier for KV rate-limiting. Prefers
+// the discord_id from the bot path (set by handleDiscordInteractions when
+// a slash command originates an AI call); falls back to a SHA-256 of the
+// mod token so each mod gets their own bucket without us putting raw
+// tokens in KV keys.
+async function aiCallerKey(request) {
+  const did = request.headers.get('x-discord-id');
+  if (did && /^[0-9]{6,32}$/.test(did)) return 'd:' + did;
+  const tok = request.headers.get('x-mod-token') || '';
+  if (!tok) return 'anon';
+  // Short SHA-256 prefix (16 hex chars = 64 bits) is plenty for rate-limit keys.
+  const buf = new TextEncoder().encode(tok);
+  const dig = await crypto.subtle.digest('SHA-256', buf);
+  const arr = new Uint8Array(dig);
+  let hex = '';
+  for (let i = 0; i < 8; i++) hex += arr[i].toString(16).padStart(2, '0');
+  return 't:' + hex;
+}
+
+// aiMinuteCheck: KV-backed sliding 60s window. Returns null on success
+// (caller proceeds), or a Response on rate-limit. Each call increments
+// the bucket; bucket TTL = 120s so two adjacent minutes don't blur.
+async function aiMinuteCheck(env, request, route) {
+  if (!env.MOD_KV) return null; // KV unbound: degrade-open (do not block AI calls).
+  const caller = await aiCallerKey(request);
+  if (caller === 'anon') return null; // anon hits should already be 401'd by checkModToken.
+  const minute = Math.floor(Date.now() / 60000);
+  const key = `ai_minute_${caller}_${minute}`;
+  let count = 0;
+  try { count = parseInt((await env.MOD_KV.get(key)) || '0', 10) || 0; } catch {}
+  if (count >= AI_PER_MOD_PER_MINUTE) {
+    return jsonResponse({
+      ok: false,
+      error: 'per-mod AI minute limit reached',
+      route,
+      cap: AI_PER_MOD_PER_MINUTE,
+      retry_after_seconds: 60 - (Math.floor(Date.now() / 1000) % 60)
+    }, 429);
+  }
+  // Best-effort increment; KV writes are eventually consistent so a sustained
+  // burst can over-count slightly across regions, which is the safe direction.
+  try { await env.MOD_KV.put(key, String(count + 1), { expirationTtl: 120 }); } catch {}
+  return null;
+}
+
+// circuitBreakerCheck / circuitBreakerRecord: per-provider open/closed/
+// half-open state. Provider IDs: 'workers-ai', 'xai', 'anthropic'.
+//
+// State key: cb_state_<provider> -> JSON { state, openedAt, fails: [tsMs,...] }
+// fails[] is a sliding 60s window of failure timestamps.
+async function circuitBreakerCheck(env, provider) {
+  if (!env.MOD_KV) return { open: false }; // KV unbound: degrade-open.
+  const key = `cb_state_${provider}`;
+  let s;
+  try { s = await env.MOD_KV.get(key, 'json'); } catch { s = null; }
+  if (!s) return { open: false };
+  const now = Date.now();
+  if (s.state === 'open') {
+    if (s.openedAt && now - s.openedAt >= CB_OPEN_DURATION_SEC * 1000) {
+      // Move to half-open: allow one probe through.
+      s.state = 'half-open';
+      try { await env.MOD_KV.put(key, JSON.stringify(s), { expirationTtl: 600 }); } catch {}
+      return { open: false, halfOpen: true };
+    }
+    return { open: true, retryAfterSec: Math.max(1, Math.ceil((CB_OPEN_DURATION_SEC * 1000 - (now - (s.openedAt || now))) / 1000)) };
+  }
+  return { open: false, halfOpen: s.state === 'half-open' };
+}
+
+async function circuitBreakerRecord(env, provider, success) {
+  if (!env.MOD_KV) return;
+  const key = `cb_state_${provider}`;
+  let s;
+  try { s = await env.MOD_KV.get(key, 'json'); } catch { s = null; }
+  if (!s) s = { state: 'closed', openedAt: 0, fails: [] };
+  const now = Date.now();
+  if (success) {
+    // Any success closes the breaker fully (incl. half-open probe).
+    s = { state: 'closed', openedAt: 0, fails: [] };
+  } else {
+    // Trim window + append.
+    const cutoff = now - CB_FAIL_WINDOW_SEC * 1000;
+    s.fails = (Array.isArray(s.fails) ? s.fails : []).filter(t => t >= cutoff);
+    s.fails.push(now);
+    if (s.fails.length >= CB_FAIL_THRESHOLD && s.state !== 'open') {
+      s.state = 'open';
+      s.openedAt = now;
+    }
+  }
+  try { await env.MOD_KV.put(key, JSON.stringify(s), { expirationTtl: 600 }); } catch {}
+}
+
+// runAiProvider: single-provider attempt, instrumented via circuit breaker.
+// `fn` is an async function returning either { ok: true, ... } or throwing.
+// Wraps the call in cb check (skip if open) + record (success/fail).
+async function runAiProvider(env, provider, fn) {
+  const cb = await circuitBreakerCheck(env, provider);
+  if (cb.open) {
+    return { ok: false, skipped: true, provider, error: 'circuit-open', retryAfter: cb.retryAfterSec };
+  }
+  try {
+    const out = await fn();
+    if (out && out.ok) {
+      await circuitBreakerRecord(env, provider, true);
+      return { ...out, provider };
+    }
+    await circuitBreakerRecord(env, provider, false);
+    return { ok: false, provider, error: (out && out.error) || 'unknown' };
+  } catch (e) {
+    await circuitBreakerRecord(env, provider, false);
+    return { ok: false, provider, error: String(e).slice(0, 300) };
+  }
+}
+
+// resolveAiOrder: maps prefer string to a strict-prefer fallback chain.
+// Llama (workers-ai) is always last because it's free + always-available.
+// Caller's `prefer` is honored as primary; the rest follow in stable order.
+function resolveAiOrder(prefer) {
+  const all = ['anthropic', 'xai', 'workers-ai'];
+  let head;
+  switch (String(prefer || '').toLowerCase()) {
+    case 'claude':
+    case 'anthropic':
+      head = 'anthropic'; break;
+    case 'grok':
+    case 'xai':
+      head = 'xai'; break;
+    case 'llama':
+    case 'workers-ai':
+    case 'workers':
+      head = 'workers-ai'; break;
+    default:
+      // Default = workers-ai first (free), then xai, then anthropic.
+      return ['workers-ai', 'xai', 'anthropic'];
+  }
+  // Strict-prefer: the chosen provider is tried first; remaining tried in
+  // stable original order. Llama always last unless the caller explicitly
+  // chose llama (in which case llama is also last by definition).
+  const tail = all.filter(p => p !== head);
+  // Push workers-ai to the very end of `tail` if it isn't already.
+  const idx = tail.indexOf('workers-ai');
+  if (idx >= 0 && idx !== tail.length - 1) {
+    tail.splice(idx, 1);
+    tail.push('workers-ai');
+  }
+  return [head, ...tail];
+}
+
+// discordWebhookSend: central wrapper for ALL Discord webhook POSTs.
+// On non-2xx (incl. 429 + 5xx) or fetch-throw, enqueues to discord_retry_queue
+// and resolves with { ok:false, queued:true } so callers don't have to do
+// retry bookkeeping. On 2xx, resolves with { ok:true, status }.
+//
+// `webhookUrlEnvKey` is the env binding KEY NAME ('DISCORD_WEBHOOK', etc.) so
+// the row stays valid across webhook URL rotations — drain reads env[key].
+async function discordWebhookSend(env, webhookUrlEnvKey, payload, opts = {}) {
+  const webhookUrl = env[webhookUrlEnvKey];
+  if (!webhookUrl) return { ok: false, error: 'webhook env not set: ' + webhookUrlEnvKey };
+  const bodyStr = JSON.stringify(payload || {});
+  let resp;
+  try {
+    resp = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: bodyStr
+    });
+  } catch (e) {
+    await discordRetryEnqueue(env, webhookUrlEnvKey, payload, 'fetch-throw: ' + String(e).slice(0, 150), opts.maxAttempts);
+    return { ok: false, queued: true, error: String(e).slice(0, 200) };
+  }
+  if (resp.ok) return { ok: true, status: resp.status };
+  await discordRetryEnqueue(env, webhookUrlEnvKey, payload, 'http ' + resp.status, opts.maxAttempts);
+  return { ok: false, queued: true, status: resp.status };
+}
+
+async function discordRetryEnqueue(env, webhookUrlEnvKey, payload, lastError, maxAttempts) {
+  if (!env.AUDIT_DB) return; // No D1 -> can't queue; the message is dropped (logged).
+  const now = Date.now();
+  // First retry in DISCORD_RETRY_BACKOFF_BASE_MS (= 30s default).
+  const nextAt = now + DISCORD_RETRY_BACKOFF_BASE_MS;
+  try {
+    await env.AUDIT_DB.prepare(
+      `INSERT INTO discord_retry_queue
+         (webhook_url, payload_json, attempts, max_attempts,
+          next_attempt_at, last_error, created_at)
+       VALUES (?, ?, 0, ?, ?, ?, ?)`
+    ).bind(
+      String(webhookUrlEnvKey).slice(0, 64),
+      JSON.stringify(payload || {}),
+      Math.min(Math.max(parseInt(maxAttempts, 10) || DISCORD_RETRY_MAX_ATTEMPTS, 1), 24),
+      nextAt,
+      String(lastError || '').slice(0, 200),
+      now
+    ).run();
+  } catch (e) {
+    // Table missing pre-017 = silent drop (logged once).
+    console.warn('[discord-retry] enqueue failed (table may be missing):', String(e).slice(0, 200));
+  }
+}
+
+// discordRetryDrain: cron-driven (and lead-debug-driven via /discord/retry/drain?force=1)
+// drain of the queue. Bounded work per call; exponential backoff per row.
+async function discordRetryDrain(env) {
+  if (!env.AUDIT_DB) return { ok: false, error: 'D1 not bound' };
+  const now = Date.now();
+  let rs;
+  try {
+    rs = await env.AUDIT_DB.prepare(
+      `SELECT id, webhook_url, payload_json, attempts, max_attempts
+         FROM discord_retry_queue
+        WHERE delivered_at IS NULL AND abandoned_at IS NULL
+          AND next_attempt_at <= ?
+        ORDER BY next_attempt_at ASC
+        LIMIT ?`
+    ).bind(now, DISCORD_RETRY_PER_TICK).all();
+  } catch (e) {
+    // Pre-017: table missing. No-op so the cron continues.
+    return { ok: false, error: 'queue table missing (pre-017)' };
+  }
+  const rows = (rs && rs.results) || [];
+  let delivered = 0, abandoned = 0, requeued = 0;
+  for (const row of rows) {
+    const url = env[row.webhook_url];
+    let payload;
+    try { payload = JSON.parse(row.payload_json || '{}'); } catch { payload = {}; }
+    let outcome;
+    if (!url) {
+      outcome = { ok: false, status: 0, err: 'webhook env unset: ' + row.webhook_url };
+    } else {
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        outcome = { ok: r.ok, status: r.status, err: r.ok ? null : 'http ' + r.status };
+      } catch (e) {
+        outcome = { ok: false, status: 0, err: 'fetch-throw: ' + String(e).slice(0, 150) };
+      }
+    }
+    const newAttempts = (row.attempts || 0) + 1;
+    if (outcome.ok) {
+      try {
+        await env.AUDIT_DB.prepare(
+          `UPDATE discord_retry_queue SET delivered_at=?, attempts=?, last_error=NULL WHERE id=?`
+        ).bind(Date.now(), newAttempts, row.id).run();
+      } catch {}
+      delivered++;
+    } else if (newAttempts >= (row.max_attempts || DISCORD_RETRY_MAX_ATTEMPTS)) {
+      try {
+        await env.AUDIT_DB.prepare(
+          `UPDATE discord_retry_queue SET abandoned_at=?, attempts=?, last_error=? WHERE id=?`
+        ).bind(Date.now(), newAttempts, String(outcome.err || '').slice(0, 200), row.id).run();
+      } catch {}
+      abandoned++;
+    } else {
+      // Exponential backoff: base * 2^(attempts-1).
+      const delay = DISCORD_RETRY_BACKOFF_BASE_MS * Math.pow(2, newAttempts - 1);
+      try {
+        await env.AUDIT_DB.prepare(
+          `UPDATE discord_retry_queue SET attempts=?, next_attempt_at=?, last_error=? WHERE id=?`
+        ).bind(newAttempts, Date.now() + delay, String(outcome.err || '').slice(0, 200), row.id).run();
+      } catch {}
+      requeued++;
+    }
+  }
+  return { ok: true, scanned: rows.length, delivered, abandoned, requeued };
+}
+
+// corsHeadersFor: returns the right access-control-allow-origin value for
+// a given request path + Origin header. Wildcard for legacy paths;
+// strict allowlist for sensitive paths.
+function isStrictPath(pathname) {
+  if (CORS_STRICT_PATH_EXACT.has(pathname)) return true;
+  for (const p of CORS_STRICT_PATH_PREFIXES) if (pathname.startsWith(p)) return true;
+  return false;
+}
+function corsAllowOriginForPath(pathname, requestOrigin) {
+  if (!isStrictPath(pathname)) return '*';
+  // Strict: echo Origin only if allowlisted.
+  if (requestOrigin && CORS_STRICT_ORIGINS.has(requestOrigin)) return requestOrigin;
+  // No allowlisted origin = no CORS allow header (browsers reject).
+  return null;
 }
 
 // v8.1.2: now async + D1-aware. Accepts EITHER the legacy shared env.MOD_TOKEN
@@ -253,7 +622,8 @@ async function handleProfilesWrite(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!rateLimitWrite(request.headers.get('x-mod-token'))) return jsonResponse({ error: 'rate limit' }, 429);
   try {
-    const body = await request.json();
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
     const { username, profile } = body;
     if (!username || !profile) return jsonResponse({ error: 'missing fields' }, 400);
     const existing = await readGithubFile(env, 'profiles.json');
@@ -277,7 +647,7 @@ async function handleHealth(request, env) {
   const out = {
     ok: true,
     service: 'gaw-mod-proxy',
-    worker_version: '5.8.x',
+    worker_version: WORKER_VERSION,
     timestamp: now,
     bindings: {
       AUDIT_DB:   !!env.AUDIT_DB,
@@ -352,69 +722,98 @@ async function handleVersion(request, env) {
 
 async function handleAiScore(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
+  // v8.3.0: per-mod minute cap (KV-backed). 429 + Retry-After hint.
+  const rl = await aiMinuteCheck(env, request, '/ai/score'); if (rl) return rl;
   const today = todayUTC();
   if (xaiDailyCounter.day !== today) { xaiDailyCounter.day = today; xaiDailyCounter.count = 0; }
 
   try {
-    const body = await request.json();
-    const { usernames } = body;
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
+    const { usernames, prefer } = body;
     if (!Array.isArray(usernames) || usernames.length === 0) return jsonResponse({ error: 'usernames required' }, 400);
     const limited = usernames.slice(0, 50);
 
     const systemPrompt = 'You are a forum moderator assistant for greatawakening.win. Given a list of usernames, return a JSON array [{u:username, risk:0-100, reason:brief}] for each. Risk is 0-100 (100 = obvious bot/troll/slur). Flag: bot patterns (WordWord1234), slurs, sexual content, political attacks on mods (pdw, shill, bot, gay, jew, homo, faggot, etc.), coordinated naming. Clean patriotic names score 0-10. Return ONLY the JSON array, no prose.';
     const userPrompt = 'Score these usernames: ' + JSON.stringify(limited);
 
-    // Try Workers AI first (FREE - 10k Neurons/day)
-    // v5.1.9: use llama-3.1-8b (stable freely available model per CF docs).
-    // Also bubble up the actual error so we can diagnose why binding may fail.
-    let workersAiError = null;
-    if (env.AI) {
-      try {
-        const resp = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ]
-        });
-        const text = (resp && (resp.response || resp.result || '')) || '';
-        let parsed;
-        try {
+    // v8.3.0: strict-prefer fallback chain with circuit breaker.
+    const order = resolveAiOrder(prefer);
+    const errors = [];
+    let fallbackCount = 0;
+    for (const provider of order) {
+      const out = await runAiProvider(env, provider, async () => {
+        if (provider === 'workers-ai') {
+          if (!env.AI) return { ok: false, error: 'env.AI binding undefined' };
+          const resp = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt }
+            ]
+          });
+          const text = (resp && (resp.response || resp.result || '')) || '';
           const m = text.match(/\[\s*\{[\s\S]*\}\s*\]/);
-          parsed = m ? JSON.parse(m[0]) : [];
-        } catch { parsed = []; }
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return jsonResponse({ scores: parsed, provider: 'workers-ai', model: 'llama-3.1-8b', cost: 0 });
+          let parsed; try { parsed = m ? JSON.parse(m[0]) : []; } catch { parsed = []; }
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            return { ok: true, scores: parsed, model: 'llama-3.1-8b', cost: 0 };
+          }
+          return { ok: false, error: 'empty or unparseable response: ' + text.slice(0, 200) };
         }
-        workersAiError = 'empty or unparseable response: ' + text.slice(0, 300);
-      } catch (e) {
-        workersAiError = String(e).slice(0, 500);
+        if (provider === 'xai') {
+          if (!env.XAI_API_KEY) return { ok: false, error: 'XAI_API_KEY not configured' };
+          if (xaiDailyCounter.count >= BUDGET_XAI_CALLS_PER_DAY) return { ok: false, error: 'xai daily budget' };
+          xaiDailyCounter.count++;
+          const xaiResp = await fetch('https://api.x.ai/v1/chat/completions', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'grok-4-fast-reasoning',
+              messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }]
+            })
+          });
+          if (!xaiResp.ok) return { ok: false, error: 'xai ' + xaiResp.status };
+          const data = await xaiResp.json();
+          const content = data?.choices?.[0]?.message?.content || '[]';
+          const m = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
+          let parsed; try { parsed = m ? JSON.parse(m[0]) : []; } catch { parsed = []; }
+          return { ok: true, scores: parsed, model: 'grok-4-fast-reasoning', cost: 0 };
+        }
+        if (provider === 'anthropic') {
+          if (!env.ANTHROPIC_API_KEY) return { ok: false, error: 'ANTHROPIC_API_KEY not configured' };
+          const aResp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'x-api-key': env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: 'claude-3-5-haiku-latest',
+              max_tokens: 1024,
+              system: systemPrompt,
+              messages: [{ role: 'user', content: userPrompt }]
+            })
+          });
+          if (!aResp.ok) return { ok: false, error: 'anthropic ' + aResp.status };
+          const data = await aResp.json();
+          const content = (data && data.content && data.content[0] && data.content[0].text) || '[]';
+          const m = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
+          let parsed; try { parsed = m ? JSON.parse(m[0]) : []; } catch { parsed = []; }
+          return { ok: true, scores: parsed, model: 'claude-3-5-haiku', cost: 0 };
+        }
+        return { ok: false, error: 'unknown provider' };
+      });
+      if (out.ok) {
+        return jsonResponse({
+          scores: out.scores, provider: out.provider, model: out.model,
+          cost: out.cost || 0, fallback_count: fallbackCount,
+          remaining: BUDGET_XAI_CALLS_PER_DAY - xaiDailyCounter.count
+        });
       }
-    } else {
-      workersAiError = 'env.AI binding is undefined';
+      errors.push({ provider: out.provider, error: out.error, skipped: !!out.skipped });
+      fallbackCount++;
     }
-
-    // Fallback: xAI
-    if (xaiDailyCounter.count >= BUDGET_XAI_CALLS_PER_DAY) return jsonResponse({ error: 'budget' }, 429);
-    if (!env.XAI_API_KEY) return jsonResponse({ error: 'no ai available' }, 503);
-    xaiDailyCounter.count++;
-
-    const xaiResp = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'grok-4-fast-reasoning',
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }]
-      })
-    });
-    if (!xaiResp.ok) return jsonResponse({ error: 'xai ' + xaiResp.status }, 502);
-    const data = await xaiResp.json();
-    const content = data?.choices?.[0]?.message?.content || '[]';
-    let parsed;
-    try {
-      const m = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
-      parsed = m ? JSON.parse(m[0]) : [];
-    } catch { parsed = []; }
-    return jsonResponse({ scores: parsed, provider: 'xai', workersAiError, remaining: BUDGET_XAI_CALLS_PER_DAY - xaiDailyCounter.count });
+    return jsonResponse({ ok: false, error: 'all providers failed', errors }, 503);
   } catch (e) { return jsonResponse({ error: String(e) }, 500); }
 }
 
@@ -426,40 +825,96 @@ async function handleAiScore(request, env) {
 // counter used by /ai/score so Grok spend stays capped.
 async function handleAiGrokChat(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
-  if (!env.XAI_API_KEY) return jsonResponse({ ok: false, error: 'XAI_API_KEY not configured on worker' }, 503);
+  // v8.3.0: per-mod minute cap (KV-backed).
+  const rl = await aiMinuteCheck(env, request, '/ai/grok-chat'); if (rl) return rl;
   try {
-    const body = await request.json();
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
     if (!prompt || prompt.length < 4) return jsonResponse({ ok: false, error: 'prompt required' }, 400);
-    // Allow-list models so callers can't point at arbitrary engines.
+    // Allow-list models for xAI; preserved for backward compat. The /ai/grok-chat
+    // route name is historical -- v8.3 still routes through the strict-prefer
+    // fallback so a Grok outage transparently uses Claude or Llama. Caller can
+    // force a specific provider via body.prefer ('claude'|'grok'|'llama').
     const allowed = new Set(['grok-3-mini', 'grok-3', 'grok-4-fast-reasoning']);
     const model = allowed.has(body.model) ? body.model : 'grok-3-mini';
     const maxTokens = Math.min(Math.max(parseInt(body.max_tokens || 500, 10) || 500, 32), 2000);
     const temperature = Math.min(Math.max(Number(body.temperature ?? 0.3), 0), 1);
-    // Daily budget: reuse xaiDailyCounter so this shares cap with /ai/score.
+    // Daily budget for xAI calls only (other providers don't share this cap).
     const today = todayUTC();
     if (xaiDailyCounter.day !== today) { xaiDailyCounter.day = today; xaiDailyCounter.count = 0; }
-    if (xaiDailyCounter.count >= BUDGET_XAI_CALLS_PER_DAY) {
-      return jsonResponse({ ok: false, error: 'daily xAI budget reached' }, 429);
+    // The prefer-string defaults to 'grok' to preserve existing /ai/grok-chat
+    // semantics: callers that pre-date prefer get Grok-first behavior.
+    const order = resolveAiOrder(body.prefer || 'grok');
+    const errors = [];
+    let fallbackCount = 0;
+    for (const provider of order) {
+      const out = await runAiProvider(env, provider, async () => {
+        if (provider === 'xai') {
+          if (!env.XAI_API_KEY) return { ok: false, error: 'XAI_API_KEY not configured' };
+          if (xaiDailyCounter.count >= BUDGET_XAI_CALLS_PER_DAY) return { ok: false, error: 'daily xAI budget' };
+          xaiDailyCounter.count++;
+          const resp = await fetch('https://api.x.ai/v1/chat/completions', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: 'user', content: prompt.slice(0, 8000) }],
+              max_tokens: maxTokens,
+              temperature
+            })
+          });
+          if (!resp.ok) {
+            const t = await resp.text();
+            return { ok: false, error: `xAI ${resp.status}: ${t.slice(0, 200)}` };
+          }
+          const data = await resp.json();
+          const text = (data?.choices?.[0]?.message?.content || '').trim();
+          return { ok: true, text, model };
+        }
+        if (provider === 'anthropic') {
+          if (!env.ANTHROPIC_API_KEY) return { ok: false, error: 'ANTHROPIC_API_KEY not configured' };
+          const aResp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'x-api-key': env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: 'claude-3-5-haiku-latest',
+              max_tokens: maxTokens,
+              messages: [{ role: 'user', content: prompt.slice(0, 8000) }]
+            })
+          });
+          if (!aResp.ok) return { ok: false, error: 'anthropic ' + aResp.status };
+          const data = await aResp.json();
+          const text = ((data && data.content && data.content[0] && data.content[0].text) || '').trim();
+          return { ok: true, text, model: 'claude-3-5-haiku' };
+        }
+        if (provider === 'workers-ai') {
+          if (!env.AI) return { ok: false, error: 'env.AI binding undefined' };
+          const resp = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+            messages: [{ role: 'user', content: prompt.slice(0, 8000) }],
+            max_tokens: maxTokens
+          });
+          const text = String((resp && (resp.response || resp.result || '')) || '').trim();
+          if (!text) return { ok: false, error: 'empty workers-ai response' };
+          return { ok: true, text, model: 'llama-3.1-8b' };
+        }
+        return { ok: false, error: 'unknown provider' };
+      });
+      if (out.ok) {
+        return jsonResponse({
+          ok: true, text: out.text, model: out.model, provider: out.provider,
+          fallback_count: fallbackCount,
+          remaining: BUDGET_XAI_CALLS_PER_DAY - xaiDailyCounter.count
+        });
+      }
+      errors.push({ provider: out.provider, error: out.error, skipped: !!out.skipped });
+      fallbackCount++;
     }
-    xaiDailyCounter.count++;
-    const resp = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt.slice(0, 8000) }],
-        max_tokens: maxTokens,
-        temperature
-      })
-    });
-    if (!resp.ok) {
-      const t = await resp.text();
-      return jsonResponse({ ok: false, error: `xAI ${resp.status}: ${t.slice(0, 200)}` }, 502);
-    }
-    const data = await resp.json();
-    const text = (data?.choices?.[0]?.message?.content || '').trim();
-    return jsonResponse({ ok: true, text, model, remaining: BUDGET_XAI_CALLS_PER_DAY - xaiDailyCounter.count });
+    return jsonResponse({ ok: false, error: 'all providers failed', errors }, 503);
   } catch (e) {
     return jsonResponse({ ok: false, error: String(e) }, 500);
   }
@@ -472,49 +927,95 @@ async function handleAiGrokChat(request, env) {
 // Falls back to xAI Grok if the AI binding is missing.
 async function handleAiBanSuggest(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
+  // v8.3.0: per-mod minute cap.
+  const rl = await aiMinuteCheck(env, request, '/ai/ban-suggest'); if (rl) return rl;
   try {
-    const body = await request.json();
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
     const username = String(body.username || '').slice(0, 64);
     const comment = String(body.comment || '').slice(0, 2000);
     const prompt = typeof body.prompt === 'string' ? body.prompt : '';
     if (!prompt) return jsonResponse({ ok: false, error: 'prompt required' }, 400);
 
-    // Primary: Workers AI Llama 3 (free tier).
-    if (env.AI) {
-      try {
-        const resp = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-          messages: [
-            { role: 'system', content: 'You are a forum moderator assistant for greatawakening.win. Given a rules context and a user comment, write a direct, professional ban reply (2-4 sentences). Never be preachy. End with an appeal-via-modmail note.' },
-            { role: 'user', content: prompt }
-          ],
-          max_tokens: 400
-        });
-        const text = String((resp && (resp.response || resp.result || '')) || '').trim();
-        if (text) return jsonResponse({ ok: true, text, provider: 'workers-ai', model: 'llama-3.1-8b', cost: 0 });
-      } catch (e) {
-        // fall through to xAI fallback
-        console.warn('[ai/ban-suggest] workers-ai fail:', String(e).slice(0, 200));
-      }
-    }
-
-    // Fallback: xAI Grok (shares daily budget with /ai/score + /ai/grok-chat).
-    if (!env.XAI_API_KEY) return jsonResponse({ ok: false, error: 'AI generation failed: no Workers AI response and no xAI fallback configured' }, 503);
+    const sys = 'You are a forum moderator assistant for greatawakening.win. Given a rules context and a user comment, write a direct, professional ban reply (2-4 sentences). Never be preachy. End with an appeal-via-modmail note.';
+    // Default prefer = 'llama' (Workers AI free) for backward-compat.
+    const order = resolveAiOrder(body.prefer || 'llama');
+    const errors = [];
+    let fallbackCount = 0;
     const today = todayUTC();
     if (xaiDailyCounter.day !== today) { xaiDailyCounter.day = today; xaiDailyCounter.count = 0; }
-    if (xaiDailyCounter.count >= BUDGET_XAI_CALLS_PER_DAY) return jsonResponse({ ok: false, error: 'daily xAI budget reached' }, 429);
-    xaiDailyCounter.count++;
-    const xr = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'grok-3-mini', messages: [{ role: 'user', content: prompt.slice(0, 8000) }], max_tokens: 400, temperature: 0.4 })
-    });
-    if (!xr.ok) {
-      const t = await xr.text();
-      return jsonResponse({ ok: false, error: `xAI fallback ${xr.status}: ${t.slice(0, 200)}` }, 502);
+    for (const provider of order) {
+      const out = await runAiProvider(env, provider, async () => {
+        if (provider === 'workers-ai') {
+          if (!env.AI) return { ok: false, error: 'env.AI binding undefined' };
+          const resp = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+            messages: [
+              { role: 'system', content: sys },
+              { role: 'user', content: prompt }
+            ],
+            max_tokens: 400
+          });
+          const text = String((resp && (resp.response || resp.result || '')) || '').trim();
+          if (!text) return { ok: false, error: 'empty workers-ai response' };
+          return { ok: true, text, model: 'llama-3.1-8b', cost: 0 };
+        }
+        if (provider === 'xai') {
+          if (!env.XAI_API_KEY) return { ok: false, error: 'XAI_API_KEY not configured' };
+          if (xaiDailyCounter.count >= BUDGET_XAI_CALLS_PER_DAY) return { ok: false, error: 'daily xAI budget' };
+          xaiDailyCounter.count++;
+          const xr = await fetch('https://api.x.ai/v1/chat/completions', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'grok-3-mini',
+              messages: [{ role: 'system', content: sys }, { role: 'user', content: prompt.slice(0, 8000) }],
+              max_tokens: 400,
+              temperature: 0.4
+            })
+          });
+          if (!xr.ok) {
+            const t = await xr.text();
+            return { ok: false, error: `xAI ${xr.status}: ${t.slice(0, 200)}` };
+          }
+          const xd = await xr.json();
+          const text = (xd?.choices?.[0]?.message?.content || '').trim();
+          if (!text) return { ok: false, error: 'empty xai response' };
+          return { ok: true, text, model: 'grok-3-mini', cost: 0 };
+        }
+        if (provider === 'anthropic') {
+          if (!env.ANTHROPIC_API_KEY) return { ok: false, error: 'ANTHROPIC_API_KEY not configured' };
+          const aResp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'x-api-key': env.ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+              'content-type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: 'claude-3-5-haiku-latest',
+              max_tokens: 400,
+              system: sys,
+              messages: [{ role: 'user', content: prompt.slice(0, 8000) }]
+            })
+          });
+          if (!aResp.ok) return { ok: false, error: 'anthropic ' + aResp.status };
+          const data = await aResp.json();
+          const text = ((data && data.content && data.content[0] && data.content[0].text) || '').trim();
+          if (!text) return { ok: false, error: 'empty anthropic response' };
+          return { ok: true, text, model: 'claude-3-5-haiku', cost: 0 };
+        }
+        return { ok: false, error: 'unknown provider' };
+      });
+      if (out.ok) {
+        return jsonResponse({
+          ok: true, text: out.text, provider: out.provider, model: out.model,
+          cost: out.cost || 0, fallback_count: fallbackCount
+        });
+      }
+      errors.push({ provider: out.provider, error: out.error, skipped: !!out.skipped });
+      fallbackCount++;
     }
-    const xd = await xr.json();
-    const xtext = (xd?.choices?.[0]?.message?.content || '').trim();
-    return jsonResponse({ ok: true, text: xtext, provider: 'xai', model: 'grok-3-mini', cost: 0 });
+    return jsonResponse({ ok: false, error: 'all providers failed', errors }, 503);
   } catch (e) {
     return jsonResponse({ ok: false, error: String(e) }, 500);
   }
@@ -526,7 +1027,8 @@ async function handleAuditLog(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
   try {
-    const body = await request.json();
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
     const { mod, action, user, details, pageUrl } = body;
     await env.AUDIT_DB.prepare(
       'INSERT INTO actions (ts, mod, action, target_user, details, page_url) VALUES (?, ?, ?, ?, ?, ?)'
@@ -694,18 +1196,33 @@ async function handleDiscordPost(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!env.DISCORD_WEBHOOK) return jsonResponse({ ok: false, error: 'no webhook set' }, 503);
   try {
-    const body = await request.json();
-    const resp = await fetch(env.DISCORD_WEBHOOK, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        content: body.content || '',
-        embeds: body.embeds || [],
-        username: body.username || 'GAW ModTools'
-      })
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
+    // v8.3.0: route through retry-aware sender. On a 2xx the message lands
+    // immediately; on a non-2xx or network error we enqueue to
+    // discord_retry_queue and the cron drains it. Caller sees ok:false +
+    // queued:true in that case so they know it's pending, not dropped.
+    const out = await discordWebhookSend(env, 'DISCORD_WEBHOOK', {
+      content: body.content || '',
+      embeds: body.embeds || [],
+      username: body.username || 'GAW ModTools'
     });
-    return jsonResponse({ ok: resp.ok, status: resp.status });
+    return jsonResponse(out);
   } catch (e) { return jsonResponse({ error: String(e) }, 500); }
+}
+
+// v8.3.0: lead-only debug drain. ?force=1 runs the same drain the cron does
+// but on demand. Returns the drain summary so we can verify the queue path
+// end-to-end without waiting up to 5 min for the next cron tick.
+async function handleDiscordRetryDrain(request, env) {
+  const lead = checkLeadToken(request, env); if (lead) return lead;
+  const url = new URL(request.url);
+  const force = url.searchParams.get('force') === '1';
+  if (!force) {
+    return jsonResponse({ ok: false, error: 'pass ?force=1 to drain (lead-only debug)' }, 400);
+  }
+  const out = await discordRetryDrain(env);
+  return jsonResponse(out);
 }
 
 // ---- v2: AbuseIPDB proxy (ip reputation) ----
@@ -3610,7 +4127,10 @@ async function handleGawPostsIngest(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
   const t0 = Date.now();
-  const body = await request.json().catch(() => ({}));
+  // v8.3.0: 1MB cap for firehose ingest (500 posts * ~1-2KB each).
+  const bodyOrResp = await safeJson(request, 1024 * 1024);
+  if (bodyOrResp instanceof Response) return bodyOrResp;
+  const body = bodyOrResp || {};
   const posts = Array.isArray(body.posts) ? body.posts.slice(0, FIREHOSE_MAX_BATCH) : [];
   const mod = (body.mod || '').slice(0, 64);
   const source = (body.source || 'client-firehose').slice(0, 64);
@@ -3687,7 +4207,10 @@ async function handleGawCommentsIngest(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
   const t0 = Date.now();
-  const body = await request.json().catch(() => ({}));
+  // v8.3.0: 1MB cap for firehose ingest.
+  const bodyOrResp = await safeJson(request, 1024 * 1024);
+  if (bodyOrResp instanceof Response) return bodyOrResp;
+  const body = bodyOrResp || {};
   const comments = Array.isArray(body.comments) ? body.comments.slice(0, FIREHOSE_MAX_BATCH) : [];
   const mod = (body.mod || '').slice(0, 64);
   const source = (body.source || 'client-firehose').slice(0, 64);
@@ -4387,7 +4910,7 @@ async function handleDashboardSummary(request, env) {
       ok: true,
       data: {
         // v6.1.3: Phase 2B plan fields (Phase 2A Home.tsx ignores unknown fields safely)
-        worker_version: '6.1.x',
+        worker_version: WORKER_VERSION,
         grok_budget_today_cents: grokBudgetTodayCents,
         grok_budget_cap_cents: grokBudgetCapCents,
         ai_calls_24h: Number(aiCalls24hRow && aiCalls24hRow.n) || 0,
@@ -5129,6 +5652,11 @@ async function handleAiShadowTriage(request, env) {
   }
   if (!env.MOD_KV)      return jsonResponse({ ok: false, error: 'KV not bound' }, 503);
   if (!env.AUDIT_DB)    return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
+  // v8.3.0: per-mod minute cap.
+  const rl = await aiMinuteCheck(env, request, '/ai/shadow-triage'); if (rl) return rl;
+  // v8.3.0: circuit breaker (xAI-only handler; multi-provider deferred).
+  const cb = await circuitBreakerCheck(env, 'xai');
+  if (cb.open) return jsonResponse({ ok: false, error: 'xai circuit open', retry_after_seconds: cb.retryAfterSec }, 503);
 
   try {
     // Shared daily budget key.
@@ -5224,20 +5752,29 @@ Hard rules:
 - Never include usernames in reason or counterarguments; cite by rule_ref + action only.`;
     const user = `<untrusted_user_content>${ctxStr}</untrusted_user_content>`;
 
-    const resp = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: V80_MODEL,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-        max_tokens: 400,
-        temperature: 0.2
-      })
-    });
+    let resp;
+    try {
+      resp = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: V80_MODEL,
+          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+          max_tokens: 400,
+          temperature: 0.2
+        })
+      });
+    } catch (e) {
+      await circuitBreakerRecord(env, 'xai', false);
+      v80LogEvent(request, { level: 'error', event: 'shadow_triage.fetch_throw', path: '/ai/shadow-triage', status: 502, latency_ms: Date.now() - t0, extra: { err: String(e).slice(0, 200) } });
+      return jsonResponse({ ok: false, error: 'xAI fetch-throw' }, 502);
+    }
     if (!resp.ok) {
+      await circuitBreakerRecord(env, 'xai', false);
       v80LogEvent(request, { level: 'error', event: 'shadow_triage.upstream_err', path: '/ai/shadow-triage', status: 502, latency_ms: Date.now() - t0, model: V80_MODEL, provider: V80_PROVIDER, extra: { xai_status: resp.status } });
       return jsonResponse({ ok: false, error: `xAI ${resp.status}` }, 502);
     }
+    await circuitBreakerRecord(env, 'xai', true);
     const data = await resp.json();
     const text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '').trim();
 
@@ -5346,7 +5883,8 @@ async function handleParkedCreate(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
   try {
-    const body = await request.json();
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
     if (!body.kind || !body.subject_id) {
       return jsonResponse({ ok: false, error: 'kind+subject_id required' }, 400);
     }
@@ -5457,6 +5995,209 @@ async function handleParkedResolve(request, env) {
     return jsonResponse({ ok: true });
   } catch(e) {
     v80LogEvent(request, { level: 'error', event: 'park.resolve_err', path: '/parked/resolve', status: 500, latency_ms: Date.now() - t0, extra: { err: String(e && e.message || e) } });
+    return jsonResponse({ ok: false, error: String(e) }, 500);
+  }
+}
+
+// --- v8.2 Mod-to-mod direct messaging ---------------------------------
+// POST /mod/message/send          { to: '<mod_username>'|'ALL', content }
+// GET  /mod/message/inbox?since=  -> { ok, data: [msgs] }
+// POST /mod/message/mark-read     { ids: [id,...] }
+// GET  /mod/message/unread-count  -> { ok, unread: <int> }
+// GET  /mod/message/mods-list     -> { ok, data: [{ mod_username, is_lead }] }
+//
+// All five are mod-auth (per-mod x-mod-token). Sender identity is derived
+// from the token via v7ModUsernameVerified, not from the body, so a
+// compromised page script cannot impersonate another mod.
+// Rate limit: 30 sends/min/mod (KV-backed, shared with rateLimitWrite bucket
+// key 'modmsg:<token>' so it doesn't collide with GitHub writes).
+
+const MOD_MSG_MAX_LEN = 2000;
+const MOD_MSG_INBOX_LIMIT = 100;
+const MOD_MSG_RATE_PER_MIN = 30;
+
+// Separate in-memory bucket so mod-messages don't share the GitHub write
+// budget. Same shape/semantics as rateLimitWrite.
+const modMsgBuckets = new Map();
+function rateLimitModMessage(token) {
+  const now = Date.now();
+  const bucket = modMsgBuckets.get(token) || [];
+  const recent = bucket.filter(t => now - t < 60_000);
+  if (recent.length >= MOD_MSG_RATE_PER_MIN) return false;
+  recent.push(now);
+  modMsgBuckets.set(token, recent);
+  return true;
+}
+
+async function handleModMessageSend(request, env) {
+  const t0 = Date.now();
+  const auth = await checkModToken(request, env); if (auth) return auth;
+  if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
+  const token = request.headers.get('x-mod-token') || '';
+  if (!rateLimitModMessage(token)) {
+    return jsonResponse({ ok: false, error: 'rate limit: 30 messages/minute' }, 429);
+  }
+  try {
+    const body = await safeJson(request);
+    if (body instanceof Response) return body;
+    const content = String(body.content || '').trim();
+    if (!content) return jsonResponse({ ok: false, error: 'content required' }, 400);
+    if (content.length > MOD_MSG_MAX_LEN) {
+      return jsonResponse({ ok: false, error: `content too long (max ${MOD_MSG_MAX_LEN})` }, 400);
+    }
+    const to = String(body.to || '').trim();
+    if (!to) return jsonResponse({ ok: false, error: 'to required' }, 400);
+
+    // Validate recipient: either literal 'ALL' or a known mod_username.
+    let resolvedTo;
+    if (to === 'ALL') {
+      resolvedTo = 'ALL';
+    } else {
+      const row = await env.AUDIT_DB.prepare(
+        'SELECT mod_username FROM mod_tokens WHERE mod_username = ? LIMIT 1'
+      ).bind(to).first();
+      if (!row) return jsonResponse({ ok: false, error: 'unknown recipient' }, 404);
+      resolvedTo = String(row.mod_username);
+    }
+
+    const from = await v7ModUsernameVerified(env, request, body);
+    if (!from || from === 'unknown') {
+      return jsonResponse({ ok: false, error: 'sender identity not resolved' }, 401);
+    }
+    const now = Date.now();
+    const res = await env.AUDIT_DB.prepare(
+      `INSERT INTO mod_messages (from_mod, to_mod, content, created_at)
+       VALUES (?, ?, ?, ?)`
+    ).bind(from, resolvedTo, content, now).run();
+    const newId = (res && res.meta && res.meta.last_row_id) || null;
+    v80LogEvent(request, { level: 'info', event: 'mod_msg.send', path: '/mod/message/send', status: 200, latency_ms: Date.now() - t0, mod: from, extra: { id: newId, to: resolvedTo, len: content.length } });
+    return jsonResponse({ ok: true, id: newId });
+  } catch(e) {
+    v80LogEvent(request, { level: 'error', event: 'mod_msg.send_err', path: '/mod/message/send', status: 500, latency_ms: Date.now() - t0, extra: { err: String(e && e.message || e) } });
+    return jsonResponse({ ok: false, error: String(e) }, 500);
+  }
+}
+
+async function handleModMessageInbox(request, env) {
+  const t0 = Date.now();
+  const auth = await checkModToken(request, env); if (auth) return auth;
+  if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
+  try {
+    const me = await v7ModUsernameVerified(env, request, null);
+    if (!me || me === 'unknown') {
+      return jsonResponse({ ok: false, error: 'caller identity not resolved' }, 401);
+    }
+    const url = new URL(request.url);
+    const sinceRaw = url.searchParams.get('since');
+    const since = sinceRaw ? Math.max(0, parseInt(sinceRaw, 10) || 0) : 0;
+    const rs = await env.AUDIT_DB.prepare(
+      `SELECT id, from_mod, to_mod, content, created_at, read_at
+         FROM mod_messages
+        WHERE (to_mod = ? OR to_mod = 'ALL')
+          AND created_at > ?
+        ORDER BY created_at DESC
+        LIMIT ?`
+    ).bind(me, since, MOD_MSG_INBOX_LIMIT).all();
+    const data = (rs && rs.results) || [];
+    v80LogEvent(request, { level: 'info', event: 'mod_msg.inbox', path: '/mod/message/inbox', status: 200, latency_ms: Date.now() - t0, mod: me, extra: { n: data.length, since } });
+    return jsonResponse({ ok: true, data });
+  } catch(e) {
+    v80LogEvent(request, { level: 'error', event: 'mod_msg.inbox_err', path: '/mod/message/inbox', status: 500, latency_ms: Date.now() - t0, extra: { err: String(e && e.message || e) } });
+    return jsonResponse({ ok: false, error: String(e) }, 500);
+  }
+}
+
+async function handleModMessageMarkRead(request, env) {
+  const t0 = Date.now();
+  const auth = await checkModToken(request, env); if (auth) return auth;
+  if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
+  try {
+    const body = await request.json();
+    const me = await v7ModUsernameVerified(env, request, body);
+    if (!me || me === 'unknown') {
+      return jsonResponse({ ok: false, error: 'caller identity not resolved' }, 401);
+    }
+    const ids = Array.isArray(body.ids) ? body.ids : [];
+    // Clamp: keep integer ids, cap batch at the inbox limit.
+    const clean = [];
+    for (const v of ids) {
+      const n = parseInt(v, 10);
+      if (Number.isFinite(n) && n > 0) clean.push(n);
+      if (clean.length >= MOD_MSG_INBOX_LIMIT) break;
+    }
+    if (!clean.length) return jsonResponse({ ok: true, marked: 0 });
+    const now = Date.now();
+    const placeholders = clean.map(() => '?').join(',');
+    // Mark read only for rows that are actually in the caller's inbox
+    // (direct to them, OR broadcast). This prevents one mod from flipping
+    // another mod's unread flag.
+    const sql = `UPDATE mod_messages
+                    SET read_at = ?
+                  WHERE read_at IS NULL
+                    AND id IN (${placeholders})
+                    AND (to_mod = ? OR to_mod = 'ALL')`;
+    const res = await env.AUDIT_DB.prepare(sql).bind(now, ...clean, me).run();
+    const marked = (res && res.meta && typeof res.meta.changes === 'number') ? res.meta.changes : 0;
+    v80LogEvent(request, { level: 'info', event: 'mod_msg.mark_read', path: '/mod/message/mark-read', status: 200, latency_ms: Date.now() - t0, mod: me, extra: { marked, requested: clean.length } });
+    return jsonResponse({ ok: true, marked });
+  } catch(e) {
+    v80LogEvent(request, { level: 'error', event: 'mod_msg.mark_read_err', path: '/mod/message/mark-read', status: 500, latency_ms: Date.now() - t0, extra: { err: String(e && e.message || e) } });
+    return jsonResponse({ ok: false, error: String(e) }, 500);
+  }
+}
+
+async function handleModMessageUnreadCount(request, env) {
+  const t0 = Date.now();
+  const auth = await checkModToken(request, env); if (auth) return auth;
+  if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
+  try {
+    const me = await v7ModUsernameVerified(env, request, null);
+    if (!me || me === 'unknown') {
+      return jsonResponse({ ok: false, error: 'caller identity not resolved' }, 401);
+    }
+    // v1 simplification: count rows where (to_mod = me OR to_mod = 'ALL')
+    // and read_at IS NULL. Broadcast 'ALL' messages read by ANY mod are
+    // considered read for everyone (documented trade-off in migration 015).
+    const row = await env.AUDIT_DB.prepare(
+      `SELECT COUNT(*) AS n FROM mod_messages
+        WHERE read_at IS NULL AND (to_mod = ? OR to_mod = 'ALL')`
+    ).bind(me).first();
+    const unread = (row && typeof row.n === 'number') ? row.n : 0;
+    return jsonResponse({ ok: true, unread });
+  } catch(e) {
+    v80LogEvent(request, { level: 'error', event: 'mod_msg.unread_err', path: '/mod/message/unread-count', status: 500, latency_ms: Date.now() - t0, extra: { err: String(e && e.message || e) } });
+    return jsonResponse({ ok: false, error: String(e) }, 500);
+  }
+}
+
+async function handleModMessageModsList(request, env) {
+  const t0 = Date.now();
+  const auth = await checkModToken(request, env); if (auth) return auth;
+  if (!env.AUDIT_DB) return jsonResponse({ ok: false, error: 'D1 not bound' }, 503);
+  try {
+    const me = await v7ModUsernameVerified(env, request, null);
+    const rs = await env.AUDIT_DB.prepare(
+      `SELECT mod_username, is_lead FROM mod_tokens
+        ORDER BY is_lead DESC, mod_username COLLATE NOCASE ASC`
+    ).all();
+    const all = (rs && rs.results) || [];
+    // Filter out the caller themselves. Dedupe on mod_username in case a
+    // mod holds multiple tokens (lead re-issues, etc.).
+    const seen = new Set();
+    const data = [];
+    for (const r of all) {
+      const u = String(r.mod_username || '').trim();
+      if (!u) continue;
+      if (me && u === me) continue;
+      const key = u.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      data.push({ mod_username: u, is_lead: !!r.is_lead });
+    }
+    v80LogEvent(request, { level: 'info', event: 'mod_msg.mods_list', path: '/mod/message/mods-list', status: 200, latency_ms: Date.now() - t0, mod: me, extra: { n: data.length } });
+    return jsonResponse({ ok: true, data });
+  } catch(e) {
+    v80LogEvent(request, { level: 'error', event: 'mod_msg.mods_list_err', path: '/mod/message/mods-list', status: 500, latency_ms: Date.now() - t0, extra: { err: String(e && e.message || e) } });
     return jsonResponse({ ok: false, error: String(e) }, 500);
   }
 }
@@ -5613,6 +6354,13 @@ async function handleAiNextBestAction(request, env) {
   const auth = await checkModToken(request, env); if (auth) return auth;
   if (!env.XAI_API_KEY) return jsonResponse({ ok: false, error: 'XAI_API_KEY not configured' }, 503);
   if (!env.MOD_KV)      return jsonResponse({ ok: false, error: 'KV not bound' }, 503);
+  // v8.3.0: per-mod minute cap.
+  const rl = await aiMinuteCheck(env, request, '/ai/next-best-action'); if (rl) return rl;
+  // v8.3.0: circuit breaker for xAI (this handler is xAI-only -- multi-provider
+  // refactor would require changing the structured JSON contract; deferred to
+  // v8.3.1 candidate).
+  const cb = await circuitBreakerCheck(env, 'xai');
+  if (cb.open) return jsonResponse({ ok: false, error: 'xai circuit open', retry_after_seconds: cb.retryAfterSec }, 503);
 
   try {
     // KV-backed daily budget — shares the bot:grok:budget:<UTC-date> key with /ai/grok-chat.
@@ -5678,20 +6426,28 @@ Output schema (JSON, no prose):
 Valid actions for kind="${kind}": ${V7_NBA_VALID[kind].join(', ')}`;
     const user = `<untrusted_user_content>${ctxStr}</untrusted_user_content>`;
 
-    const resp = await fetch('https://api.x.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'grok-3-mini',
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-        max_tokens: 300,
-        temperature: 0.2
-      })
-    });
+    let resp;
+    try {
+      resp = await fetch('https://api.x.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${env.XAI_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'grok-3-mini',
+          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+          max_tokens: 300,
+          temperature: 0.2
+        })
+      });
+    } catch (e) {
+      await circuitBreakerRecord(env, 'xai', false);
+      return jsonResponse({ ok: false, error: 'xAI fetch-throw: ' + String(e).slice(0, 200) }, 502);
+    }
     if (!resp.ok) {
+      await circuitBreakerRecord(env, 'xai', false);
       const t = await resp.text();
       return jsonResponse({ ok: false, error: `xAI ${resp.status}: ${t.slice(0, 200)}` }, 502);
     }
+    await circuitBreakerRecord(env, 'xai', true);
     const data = await resp.json();
     const text = (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '').trim();
 
@@ -6248,15 +7004,34 @@ export default {
     if (request.method === 'OPTIONS') {
       // CORS preflight. HTTP 204 MUST have empty body (RFC 7230);
       // jsonResponse({},204) throws error-1101 because it writes "{}" as body.
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'access-control-allow-origin': '*',
-          'access-control-allow-headers': 'content-type,x-mod-token,x-lead-token',
-          'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-max-age': '86400'
-        }
-      });
+      // v8.3.0: strict-origin lockdown for /admin/* and /bot/{register-commands,
+      // mods/add, mods/remove}. All other paths keep wildcard for
+      // backward-compat with the extension's content-script callers.
+      const reqOrigin = request.headers.get('origin') || '';
+      const allow = corsAllowOriginForPath(url.pathname, reqOrigin);
+      const corsHeaders = {
+        'access-control-allow-headers': 'content-type,x-mod-token,x-lead-token,x-discord-id',
+        'access-control-allow-methods': 'GET,POST,OPTIONS',
+        'access-control-max-age': '86400'
+      };
+      if (allow) corsHeaders['access-control-allow-origin'] = allow;
+      // Strict path with non-allowlisted origin -> respond 204 with no
+      // allow-origin header so the browser blocks the call.
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // v8.3.0: server-side strict-path gate. Blocks the actual request from
+    // non-allowlisted origins on /admin/* and /bot/{register-commands,
+    // mods/add, mods/remove}. The OPTIONS preflight already withholds
+    // allow-origin so a compliant browser blocks before this fires; this
+    // gate is defense-in-depth for direct curl/non-browser callers.
+    if (isStrictPath(url.pathname)) {
+      const reqOrigin = request.headers.get('origin') || '';
+      // Allow no-origin (e.g. server-to-server cron, curl) AND allowlisted
+      // origins. Reject only when an origin header is present AND mismatched.
+      if (reqOrigin && !CORS_STRICT_ORIGINS.has(reqOrigin)) {
+        return jsonResponse({ error: 'origin not allowed for this endpoint' }, 403);
+      }
     }
 
     try {
@@ -6300,7 +7075,8 @@ export default {
         case '/presence/online': return await handlePresenceOnline(request, env);
         case '/invite/create':   return await handleInviteCreate(request, env);
         case '/invite/claim':    return await handleInviteClaim(request, env);
-        case '/discord/post':    return await handleDiscordPost(request, env);
+        case '/discord/post':           return await handleDiscordPost(request, env);
+        case '/discord/retry/drain':    return await handleDiscordRetryDrain(request, env);
         case '/abuse/check':     return await handleAbuseCheck(request, env);
         case '/search':          return await handleSearch(request, env);
         case '/bug/report':      return await handleBugReport(request, env);
@@ -6351,6 +7127,12 @@ export default {
         case '/parked/create':       return await handleParkedCreate(request, env);
         case '/parked/list':         return await handleParkedList(request, env);
         case '/parked/resolve':      return await handleParkedResolve(request, env);
+        // v8.2 Mod-to-mod direct messaging (chat panel + status-bar icon).
+        case '/mod/message/send':          return await handleModMessageSend(request, env);
+        case '/mod/message/inbox':         return await handleModMessageInbox(request, env);
+        case '/mod/message/mark-read':     return await handleModMessageMarkRead(request, env);
+        case '/mod/message/unread-count':  return await handleModMessageUnreadCount(request, env);
+        case '/mod/message/mods-list':     return await handleModMessageModsList(request, env);
         case '/ai-suspect/enqueue':  return await handleAiSuspectEnqueue(request, env);
         case '/ai-suspect/list':     return await handleAiSuspectList(request, env);
         case '/ai-suspect/decide':   return await handleAiSuspectDecide(request, env);
@@ -6397,6 +7179,11 @@ export default {
     // Inert until migration 013 applied (the DELETEs touch non-existent tables
     // pre-migration and are swallowed by the handler's try/catch).
     ctx.waitUntil(teamProductivityCronTick(env, ctx).catch(e => console.error('[cron] teamProductivityCronTick', e)));
+    // v8.3.0: Discord webhook retry queue drain. Inert until migration 017
+    // applied (drain swallows table-missing errors).
+    ctx.waitUntil(discordRetryDrain(env)
+      .then(r => { if (r && r.ok && r.scanned > 0) console.log('[cron] discord-retry', JSON.stringify(r)); })
+      .catch(e => console.error('[cron] discordRetryDrain', e)));
     console.log('[cron] tick at', new Date().toISOString());
   }
 };
